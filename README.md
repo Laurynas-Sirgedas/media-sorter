@@ -190,13 +190,13 @@ py media_organizer.py --strip-repaired-suffix
 
 For example, `DSC00363_2_repaired.jpg` becomes `DSC00363_2.jpg`.
 
-Some sync or recovery tools instead append a random numeric ID, such as `song_170385735.mp3`. To remove that pattern:
+Some sync or recovery tools instead append a random numeric ID to audio files, such as `song_170385735.mp3`. To remove that pattern:
 
 ```powershell
 py media_organizer.py --strip-numeric-suffix
 ```
 
-This only strips a trailing separator followed by 4 or more digits, so short/meaningful numbers (like a track number `song_12.mp3`) are left untouched. Both flags can be combined.
+This only applies to audio files, and only strips a trailing separator followed by 4 or more digits, so short/meaningful numbers (like a track number `song_12.mp3`) are left untouched. Both flags can be combined.
 
 ### Rerunning on an already organized folder
 

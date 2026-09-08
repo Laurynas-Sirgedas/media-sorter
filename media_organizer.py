@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strip-numeric-suffix",
         action="store_true",
-        help="Remove a trailing random numeric ID, such as '_170385735', appended by sync or recovery tools.",
+        help="Remove a trailing random numeric ID, such as '_170385735', from audio filenames only.",
     )
     parser.add_argument(
         "--exclude-thumbnails",
@@ -622,7 +622,7 @@ def move_media(
             camera = item.camera or unknown_name
             destination_folder = output / camera
         target_name = strip_repaired_suffix(item.path.name) if strip_repaired else item.path.name
-        target_name = strip_numeric_suffix(target_name) if strip_numeric else target_name
+        target_name = strip_numeric_suffix(target_name) if strip_numeric and item.kind == "audio" else target_name
         prospective_destination = destination_folder / target_name
         if prospective_destination.resolve() == item.path.resolve():
             skipped_in_place += 1
