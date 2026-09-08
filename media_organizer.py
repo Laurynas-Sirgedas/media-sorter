@@ -47,7 +47,7 @@ class MediaFile:
     duplicate_of: Path | None = None
 
 
-DEDUPE_KEYS = {"name", "size", "date", "sha256"}
+DEDUPE_KEYS = {"name", "size", "date", "sha256", "stem"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,7 +59,27 @@ def parse_args() -> argparse.Namespace:
         type=parse_dedupe_keys,
         default=(),
         metavar="KEYS",
-        help="Mark duplicates when all selected keys match: name,size,date,sha256 (comma-separated).",
+        help="Mark duplicates when all selected keys match: name,size,date,sha256,stem (comma-separated).",
+    )
+    parser.add_argument(
+        "--trash-duplicates",
+        action="store_true",
+        help="Move duplicates to a Trash Bin folder instead of a Duplicates folder, for manual removal.",
+    )
+    parser.add_argument(
+        "--separate-audio",
+        action="store_true",
+        help="Place audio files directly in an Audio folder instead of a camera-model folder.",
+    )
+    parser.add_argument(
+        "--strip-repaired-suffix",
+        action="store_true",
+        help="Remove the '_repaired' keyword (and its numbered variants) from filenames when organizing.",
+    )
+    parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Rescan an already organized folder (source and output may be the same) to fix corrupted or duplicate files.",
     )
     return parser.parse_args()
 
@@ -104,7 +124,7 @@ def is_inside(path: Path, parent: Path) -> bool:
         return False
 
 
-def scan_files(source: Path, output: Path) -> list[MediaFile]:
+def scan_files(source: Path, output: Path, exclude_output: bool = True) -> list[MediaFile]:
     found: list[MediaFile] = []
     visited = 0
     started = time.monotonic()
@@ -113,7 +133,7 @@ def scan_files(source: Path, output: Path) -> list[MediaFile]:
 
     for root, directories, filenames in os.walk(source, topdown=True, onerror=lambda error: None):
         root_path = Path(root)
-        if is_inside(root_path, output):
+        if exclude_output and is_inside(root_path, output):
             directories[:] = []
             continue
         directories[:] = [directory for directory in directories if not directory.startswith("$")]
@@ -132,6 +152,26 @@ def scan_files(source: Path, output: Path) -> list[MediaFile]:
 def clean_folder_name(value: str) -> str:
     value = re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", value).strip(" .")
     return value[:120] or "unknown camera"
+
+
+def normalize_stem(stem: str) -> str:
+    """Strip recovery-tool noise (hashes, '(deleted ...)', '_repaired') so patterned duplicates match."""
+    text = stem
+    text = re.sub(r"\(deleted[^)]*\)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"b['\"][0-9a-f]{8,}['\"]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[`'][0-9]{6,}[`']", "", text)
+    text = re.sub(r"[_\-\s]*\d+[_\-\s]*repaired", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[_\-\s]*repaired", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[_\-\s]{2,}", "_", text)
+    text = text.strip("_- ")
+    return text.casefold() or stem.casefold()
+
+
+def strip_repaired_suffix(filename: str) -> str:
+    path = Path(filename)
+    stem = re.sub(r"[ _-]*repaired", "", path.stem, flags=re.IGNORECASE)
+    stem = stem.strip(" _-")
+    return f"{stem or path.stem}{path.suffix}"
 
 
 def exif_text(exif: object, names: tuple[str, ...]) -> str:
@@ -162,6 +202,31 @@ def file_date(path: Path) -> datetime:
     return datetime.fromtimestamp(path.stat().st_mtime)
 
 
+def longest_flat_run(lines: list[list[int]], tolerance: int) -> int:
+    longest = 0
+    run = 0
+    for line in lines:
+        if max(line) - min(line) <= tolerance:
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    return longest
+
+
+def detect_block_corruption(image: Image.Image) -> str | None:
+    """Flag large uniform bands typical of a truncated/partial JPEG decode."""
+    size = 128
+    tolerance = 4
+    min_run = max(1, int(size * 0.15))
+    pixels = list(image.convert("L").resize((size, size)).getdata())
+    rows = [pixels[row * size:(row + 1) * size] for row in range(size)]
+    columns = [pixels[col::size] for col in range(size)]
+    if longest_flat_run(rows, tolerance) >= min_run or longest_flat_run(columns, tolerance) >= min_run:
+        return "image contains a large uniform block, likely a truncated or corrupted decode"
+    return None
+
+
 def validate_photo(media: MediaFile) -> None:
     try:
         with Image.open(media.path) as image:
@@ -174,6 +239,9 @@ def validate_photo(media: MediaFile) -> None:
             extrema = image.convert("L").getextrema()
             if extrema[0] == extrema[1] and extrema[0] in (0, 255):
                 raise ValueError("image contains only pure black or white pixels")
+            block_issue = detect_block_corruption(image)
+            if block_issue:
+                raise ValueError(block_issue)
             exif = image.getexif()
             make = str(exif.get(271, "")).strip()
             model = str(exif.get(272, "")).strip()
@@ -273,6 +341,8 @@ def dedupe_key(media: MediaFile, keys: tuple[str, ...]) -> tuple[object, ...] | 
                 values.append(captured.isoformat())
             elif key == "sha256":
                 values.append(sha256_file(media.path))
+            elif key == "stem":
+                values.append(normalize_stem(media.path.stem))
         except OSError:
             return None
     return tuple(values)
@@ -307,19 +377,38 @@ def choose_unknown_name(media: Iterable[MediaFile]) -> str:
     return clean_folder_name(answer or "unknown camera")
 
 
-def move_media(media: list[MediaFile], output: Path, unknown_name: str, dry_run: bool, copy: bool) -> None:
+def move_media(
+    media: list[MediaFile],
+    output: Path,
+    unknown_name: str,
+    dry_run: bool,
+    copy: bool,
+    separate_audio: bool = False,
+    trash_duplicates: bool = False,
+    strip_repaired: bool = False,
+) -> None:
     print("\nSTEP 4/4 - Organizing files")
     counts = {"valid": 0, "unchecked": 0, "corrupted": 0}
+    skipped_in_place = 0
+    duplicate_count = sum(1 for item in media if item.is_duplicate)
     for index, item in enumerate(media, 1):
+        counts[item.status] += 1
         if item.status == "corrupted":
             destination_folder = output / "Corrupted"
         elif item.is_duplicate:
-            destination_folder = output / "Duplicates"
+            destination_folder = output / ("Trash Bin" if trash_duplicates else "Duplicates")
+        elif separate_audio and item.kind == "audio":
+            destination_folder = output / "Audio"
         else:
             camera = item.camera or unknown_name
             destination_folder = output / camera
-        destination = unique_destination(destination_folder / item.path.name)
-        counts[item.status] += 1
+        target_name = strip_repaired_suffix(item.path.name) if strip_repaired else item.path.name
+        prospective_destination = destination_folder / target_name
+        if prospective_destination.resolve() == item.path.resolve():
+            skipped_in_place += 1
+            print(f"\r{index:,}/{len(media):,} SKIP (already in place): {item.path}", end="", flush=True)
+            continue
+        destination = unique_destination(prospective_destination)
         action = "COPY" if copy else "MOVE"
         print(f"\r{index:,}/{len(media):,} {action}: {item.path.name} -> {destination}", end="", flush=True)
         if not dry_run:
@@ -329,6 +418,11 @@ def move_media(media: list[MediaFile], output: Path, unknown_name: str, dry_run:
             else:
                 shutil.move(str(item.path), str(destination))
     print(f"\nDone. Valid: {counts['valid']:,}; unchecked: {counts['unchecked']:,}; corrupted: {counts['corrupted']:,}.")
+    if duplicate_count:
+        bin_name = "Trash Bin" if trash_duplicates else "Duplicates"
+        print(f"{duplicate_count:,} duplicate files were placed in '{bin_name}' for review.")
+    if skipped_in_place:
+        print(f"Skipped {skipped_in_place:,} files already in their correct location.")
     if counts["unchecked"]:
         print("Note: unchecked video/audio files were placed with valid media because ffprobe was unavailable.")
 
@@ -338,13 +432,15 @@ def main() -> int:
     print("Media Organizer")
     source = prompt_folder("1) Folder or drive to scan (example C:\\): ")
     output = prompt_folder("2) Existing output folder or drive (example F:\\): ")
-    if source == output or is_inside(output, source):
+    if args.in_place:
+        print("IN-PLACE MODE: rescanning the destination itself to fix corrupted or duplicate files.")
+    elif source == output or is_inside(output, source):
         print("The output folder must not be inside the scan folder, or it could be scanned again.")
         return 2
     if args.dry_run:
         print("DRY RUN: no files will be changed.")
 
-    media = scan_files(source, output)
+    media = scan_files(source, output, exclude_output=not args.in_place)
     if not media:
         return 0
 
@@ -363,7 +459,11 @@ def main() -> int:
     if answer not in {"y", "yes"}:
         print("No files were changed.")
         return 0
-    move_media(media, output, unknown_name, args.dry_run, args.copy)
+    move_media(
+        media, output, unknown_name, args.dry_run, args.copy,
+        separate_audio=args.separate_audio, trash_duplicates=args.trash_duplicates,
+        strip_repaired=args.strip_repaired_suffix,
+    )
     return 0
 
 

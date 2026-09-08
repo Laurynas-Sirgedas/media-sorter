@@ -8,14 +8,16 @@ The organizer scans a folder or an entire drive, validates media, reads camera m
 
 - Recursively scans folders and drives for common photo, video, and audio formats.
 - Displays scan and validation progress, including file counts.
-- Validates images by decoding their contents, checking dimensions, and detecting pure black or white images.
+- Validates images by decoding their contents, checking dimensions, and detecting pure black/white or large uniform-color blocks typical of truncated decodes.
 - Uses `ffprobe` for video and audio probing when FFmpeg is installed.
 - Reads camera maker and model metadata, such as `Apple iPhone XS`.
 - Prompts for a folder name when media has no camera metadata.
 - Places files with missing camera metadata in `unknown camera` by default.
+- Optionally places all audio files directly in an `Audio` folder with `--separate-audio`.
 - Moves unreadable media to `Corrupted` for manual review.
 - Optionally detects duplicates using name, size, date, SHA-256, or a combination of those keys.
-- Moves detected duplicates to `Duplicates` for review instead of deleting them.
+- Moves detected duplicates to `Duplicates` for review, or permanently deletes them with `--delete-duplicates`.
+- Supports `--in-place` to safely rescan an already organized folder and fix newly found corruption or duplicates.
 - Never overwrites an existing file; name collisions receive a numeric suffix.
 - Supports dry runs and copying instead of moving.
 
@@ -121,8 +123,49 @@ Supported keys:
 - `size`: file size in bytes.
 - `date`: capture date when available, otherwise the file modification timestamp.
 - `sha256`: exact file-content hash, calculated in streaming chunks.
+- `stem`: filename with recovery-tool noise removed, such as `(deleted <hash>)` segments, backtick-wrapped hash/timestamp tokens, and `_repaired` suffixes. This matches patterns like `DSC00363_2_repaired.jpg` and `DSC00363_30_repaired.jpg` to the same base name `DSC00363`.
 
-When multiple keys are selected, all of them must match. The first file found is kept in its normal camera folder; later matching files are placed in `Duplicates`. Duplicate files are never deleted. Use `--dry-run` to review the planned result before moving or copying anything.
+`stem` cannot match files that use entirely different naming schemes for the same photo (for example, a camera-generated name versus a metadata-based name assembled by a recovery tool). For those cases, use `sha256` to compare actual file content instead.
+
+When multiple keys are selected, all of them must match. The first file found is kept in its normal camera folder; later matching files are placed in `Duplicates` (or `Trash Bin` with `--trash-duplicates`). Use `--dry-run` to review the planned result before moving or copying anything.
+
+To move duplicates to a separate `Trash Bin` folder instead of `Duplicates`, for manual review and removal:
+
+```powershell
+py media_organizer.py --dedupe-by sha256 --trash-duplicates
+```
+
+Duplicates are never deleted automatically. Review the `Trash Bin` folder and delete its contents yourself once you are satisfied.
+
+### Cleaning up recovery-tool filenames
+
+Some photo recovery tools append a `_repaired` marker (and a numbered variant such as `_2_repaired`) to filenames. To remove just the `_repaired` keyword while keeping the rest of the filename intact:
+
+```powershell
+py media_organizer.py --strip-repaired-suffix
+```
+
+For example, `DSC00363_2_repaired.jpg` becomes `DSC00363_2.jpg`.
+
+### Rerunning on an already organized folder
+
+If earlier organizing left corrupted or duplicate files mixed in with good ones (for example, after a first pass without `--dedupe-by`), rerun the tool with `--in-place` and point both prompts at the same already organized folder:
+
+```powershell
+py media_organizer.py --in-place --dry-run --dedupe-by sha256
+```
+
+In-place mode allows the source and destination to be the same folder. Files already in their correct location are skipped; newly detected corrupted or duplicate files are moved to `Corrupted` or `Duplicates` without being copied needlessly.
+
+### Separating audio files
+
+By default, audio files are organized by device/camera metadata like photos and videos. To keep all audio together instead:
+
+```powershell
+py media_organizer.py --separate-audio
+```
+
+All audio files are then placed directly in an `Audio` folder, regardless of embedded metadata.
 
 You can also double-click `run_media_organizer.bat` from Windows Explorer. Add `--dry-run` or `--copy` after the batch file name when launching it from a terminal.
 
@@ -151,8 +194,10 @@ The script recognizes common formats including:
 - The source and destination must not be the same folder, and the destination must not be inside the source scan path.
 - The script does not overwrite existing files. It creates names such as `photo (1).jpg` when necessary.
 - Duplicate detection is not enabled unless `--dedupe-by` is provided.
-- `name` or `date` alone can produce broad matches. For safer results, prefer `sha256` or combine it with other keys.
-- Image validation can detect unreadable files and pure black or white images, but no automated check can identify every visually damaged image.
+- `name`, `date`, or `stem` alone can produce broad matches. For safer results, prefer `sha256` or combine it with other keys.
+- `--trash-duplicates` moves files to a `Trash Bin` folder; it does not delete anything automatically.
+- `--in-place` is the only way to scan and organize the same folder. Without it, the source and destination must not overlap.
+- Image validation can detect unreadable files, pure black or white images, and large uniform blocks from truncated decodes, but no automated check can identify every visually damaged image.
 - Video and audio validation requires `ffprobe`. Without it, those files remain `unchecked` and are preserved with the other media.
 - Capture dates are not used to create folders. Use Windows Explorer's Date taken, Media created, or Date modified columns to sort the files.
 
