@@ -190,16 +190,18 @@ def ffprobe(path: Path) -> dict | None:
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format_tags:stream_tags", "-of", "json", str(path)],
-            capture_output=True, text=True, timeout=90, check=False,
+            capture_output=True, timeout=90, check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
-        return {"error": result.stderr.strip() or "ffprobe rejected the file"}
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        return {"error": error or "ffprobe rejected the file"}
     try:
-        return json.loads(result.stdout)
+        output = result.stdout.decode("utf-8", errors="replace")
+        return json.loads(output)
     except json.JSONDecodeError:
-        return {"error": "ffprobe returned invalid data"}
+        return {"unchecked": "ffprobe returned invalid or undecodable metadata"}
 
 
 def validate_non_photo(media: MediaFile) -> None:
@@ -212,6 +214,11 @@ def validate_non_photo(media: MediaFile) -> None:
     if "error" in probe:
         media.status = "corrupted"
         media.reason = probe["error"]
+        return
+    if "unchecked" in probe:
+        media.status = "unchecked"
+        media.reason = probe["unchecked"]
+        media.captured_at = file_date(media.path)
         return
     tags: dict = {}
     tags.update(probe.get("format", {}).get("tags", {}))
