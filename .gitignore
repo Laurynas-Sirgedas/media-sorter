@@ -1,0 +1,17 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment and tool files
+.env
+.vscode/
+
+# Windows metadata
+Thumbs.db
+Desktop.ini
