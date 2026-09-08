@@ -14,6 +14,8 @@ The organizer scans a folder or an entire drive, validates media, reads camera m
 - Prompts for a folder name when media has no camera metadata.
 - Places files with missing camera metadata in `unknown camera` by default.
 - Moves unreadable media to `Corrupted` for manual review.
+- Optionally detects duplicates using name, size, date, SHA-256, or a combination of those keys.
+- Moves detected duplicates to `Duplicates` for review instead of deleting them.
 - Never overwrites an existing file; name collisions receive a numeric suffix.
 - Supports dry runs and copying instead of moving.
 
@@ -26,6 +28,8 @@ F:\Media Organized\
 │   └── IMG_0002.MOV
 ├── unknown camera\
 │   └── recording.mp4
+├── Duplicates\
+│   └── IMG_0001 (1).JPG
 └── Corrupted\
     └── damaged.jpg
 ```
@@ -96,6 +100,30 @@ To preserve the original files and place copies in the destination, use:
 py media_organizer.py --copy
 ```
 
+### Duplicate detection
+
+Duplicate detection is opt-in. Choose one or more comma-separated keys with `--dedupe-by`:
+
+```powershell
+# Recommended: exact file-content matching
+py media_organizer.py --dry-run --dedupe-by sha256
+
+# Require every selected key to match
+py media_organizer.py --dry-run --dedupe-by name,size,date
+
+# Combine metadata and exact-content checks
+py media_organizer.py --dry-run --dedupe-by name,size,sha256
+```
+
+Supported keys:
+
+- `name`: filename, compared without case differences.
+- `size`: file size in bytes.
+- `date`: capture date when available, otherwise the file modification timestamp.
+- `sha256`: exact file-content hash, calculated in streaming chunks.
+
+When multiple keys are selected, all of them must match. The first file found is kept in its normal camera folder; later matching files are placed in `Duplicates`. Duplicate files are never deleted. Use `--dry-run` to review the planned result before moving or copying anything.
+
 You can also double-click `run_media_organizer.bat` from Windows Explorer. Add `--dry-run` or `--copy` after the batch file name when launching it from a terminal.
 
 ## Processing steps
@@ -104,7 +132,8 @@ The workflow is intentionally sequential:
 
 1. **Scan**: find supported media recursively and show progress.
 2. **Validate**: inspect image contents and probe video/audio when possible.
-3. **Organize**: move or copy files into camera folders after confirmation.
+3. **Deduplicate**: optionally compare selected file keys and identify duplicates.
+4. **Organize**: move or copy files into camera folders after confirmation.
 
 Corrupted files are never deleted. They are moved to the destination's `Corrupted` folder so they can be reviewed separately.
 
@@ -121,6 +150,8 @@ The script recognizes common formats including:
 - Test with `--dry-run` first, especially when scanning an entire drive.
 - The source and destination must not be the same folder, and the destination must not be inside the source scan path.
 - The script does not overwrite existing files. It creates names such as `photo (1).jpg` when necessary.
+- Duplicate detection is not enabled unless `--dedupe-by` is provided.
+- `name` or `date` alone can produce broad matches. For safer results, prefer `sha256` or combine it with other keys.
 - Image validation can detect unreadable files and pure black or white images, but no automated check can identify every visually damaged image.
 - Video and audio validation requires `ffprobe`. Without it, those files remain `unchecked` and are preserved with the other media.
 - Capture dates are not used to create folders. Use Windows Explorer's Date taken, Media created, or Date modified columns to sort the files.

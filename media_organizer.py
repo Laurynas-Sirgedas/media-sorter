@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -42,13 +43,34 @@ class MediaFile:
     reason: str = ""
     camera: str = ""
     captured_at: datetime | None = None
+    is_duplicate: bool = False
+    duplicate_of: Path | None = None
+
+
+DEDUPE_KEYS = {"name", "size", "date", "sha256"}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Find, validate, and organize photos, videos, and audio.")
     parser.add_argument("--dry-run", action="store_true", help="Show actions without moving files.")
     parser.add_argument("--copy", action="store_true", help="Copy files instead of moving them.")
+    parser.add_argument(
+        "--dedupe-by",
+        type=parse_dedupe_keys,
+        default=(),
+        metavar="KEYS",
+        help="Mark duplicates when all selected keys match: name,size,date,sha256 (comma-separated).",
+    )
     return parser.parse_args()
+
+
+def parse_dedupe_keys(value: str) -> tuple[str, ...]:
+    keys = tuple(dict.fromkeys(part.strip().lower() for part in value.split(",") if part.strip()))
+    invalid = set(keys) - DEDUPE_KEYS
+    if invalid:
+        allowed = ", ".join(sorted(DEDUPE_KEYS))
+        raise argparse.ArgumentTypeError(f"unknown dedupe key(s): {', '.join(sorted(invalid))}; choose from {allowed}")
+    return keys
 
 
 def prompt_folder(prompt: str) -> Path:
@@ -86,7 +108,7 @@ def scan_files(source: Path, output: Path) -> list[MediaFile]:
     found: list[MediaFile] = []
     visited = 0
     started = time.monotonic()
-    print("\nSTEP 1/3 - Scanning for media files")
+    print("\nSTEP 1/4 - Scanning for media files")
     print("This can take a while on a whole drive. Press Ctrl+C to stop safely.\n")
 
     for root, directories, filenames in os.walk(source, topdown=True, onerror=lambda error: None):
@@ -223,6 +245,52 @@ def unique_destination(destination: Path) -> Path:
     raise RuntimeError(f"Could not create a unique destination for {destination.name}")
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def dedupe_key(media: MediaFile, keys: tuple[str, ...]) -> tuple[object, ...] | None:
+    values: list[object] = []
+    for key in keys:
+        try:
+            if key == "name":
+                values.append(media.path.name.casefold())
+            elif key == "size":
+                values.append(media.path.stat().st_size)
+            elif key == "date":
+                captured = media.captured_at or file_date(media.path)
+                values.append(captured.isoformat())
+            elif key == "sha256":
+                values.append(sha256_file(media.path))
+        except OSError:
+            return None
+    return tuple(values)
+
+
+def mark_duplicates(media: list[MediaFile], keys: tuple[str, ...]) -> int:
+    if not keys:
+        return 0
+    print(f"\nSTEP 3/4 - Checking duplicates by: {', '.join(keys)}")
+    seen: dict[tuple[object, ...], MediaFile] = {}
+    duplicates = 0
+    candidates = [item for item in media if item.status != "corrupted"]
+    for index, item in enumerate(candidates, 1):
+        key = dedupe_key(item, keys)
+        if key is not None:
+            original = seen.setdefault(key, item)
+            if original is not item:
+                item.is_duplicate = True
+                item.duplicate_of = original.path
+                duplicates += 1
+        print(f"\rChecked duplicates: {index:,}/{len(candidates):,} | Duplicates: {duplicates:,}", end="", flush=True)
+    print(f"\nDuplicate check complete: {duplicates:,} duplicate files found.")
+    return duplicates
+
+
 def choose_unknown_name(media: Iterable[MediaFile]) -> str:
     samples = [item for item in media if item.camera == ""][:5]
     print("\nSome valid media files do not contain camera maker/model metadata.")
@@ -233,11 +301,13 @@ def choose_unknown_name(media: Iterable[MediaFile]) -> str:
 
 
 def move_media(media: list[MediaFile], output: Path, unknown_name: str, dry_run: bool, copy: bool) -> None:
-    print("\nSTEP 3/3 - Organizing files")
+    print("\nSTEP 4/4 - Organizing files")
     counts = {"valid": 0, "unchecked": 0, "corrupted": 0}
     for index, item in enumerate(media, 1):
         if item.status == "corrupted":
             destination_folder = output / "Corrupted"
+        elif item.is_duplicate:
+            destination_folder = output / "Duplicates"
         else:
             camera = item.camera or unknown_name
             destination_folder = output / camera
@@ -271,13 +341,14 @@ def main() -> int:
     if not media:
         return 0
 
-    print("\nSTEP 2/3 - Validating media")
+    print("\nSTEP 2/4 - Validating media")
     for index, item in enumerate(media, 1):
         validate(item)
         print(f"\rChecked: {index:,}/{len(media):,} | {item.status.upper():10} | {item.path.name}", end="", flush=True)
     print()
     corrupted = [item for item in media if item.status == "corrupted"]
-    unknown = [item for item in media if item.status != "corrupted" and not item.camera]
+    mark_duplicates(media, args.dedupe_by)
+    unknown = [item for item in media if item.status != "corrupted" and not item.is_duplicate and not item.camera]
     print(f"Validation complete: {len(corrupted):,} corrupted; {len(unknown):,} without camera metadata.")
     unknown_name = choose_unknown_name(unknown) if unknown else "unknown camera"
 
