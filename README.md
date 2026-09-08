@@ -12,11 +12,12 @@ The organizer scans a folder or an entire drive, validates media, reads camera m
 - Uses `ffprobe` for video and audio probing when FFmpeg is installed.
 - Reads camera maker and model metadata, such as `Apple iPhone XS`.
 - Prompts for a folder name when media has no camera metadata.
-- Places files with missing camera metadata in `unknown camera` by default.
+- Places files with missing camera metadata in `unknown device` by default.
 - Optionally places all audio files directly in an `Audio` folder with `--separate-audio`.
 - Moves unreadable media to `Corrupted` for manual review.
-- Optionally detects duplicates using name, size, date, SHA-256, or a combination of those keys.
-- Moves detected duplicates to `Duplicates` for review, or permanently deletes them with `--delete-duplicates`.
+- Optionally excludes small thumbnail-sized photos with `--exclude-thumbnails`, moving them to `Trash Bin`.
+- Optionally detects duplicates using name, size, date, SHA-256, a perceptual visual hash, or a combination of those keys.
+- Moves detected duplicates to `Duplicates` for review, or to `Trash Bin` with `--trash-duplicates`.
 - Supports `--in-place` to safely rescan an already organized folder and fix newly found corruption or duplicates.
 - Never overwrites an existing file; name collisions receive a numeric suffix.
 - Supports dry runs and copying instead of moving.
@@ -28,7 +29,7 @@ F:\Media Organized\
 ├── Apple iPhone XS\
 │   ├── IMG_0001.JPG
 │   └── IMG_0002.MOV
-├── unknown camera\
+├── unknown device\
 │   └── recording.mp4
 ├── Duplicates\
 │   └── IMG_0001 (1).JPG
@@ -102,6 +103,16 @@ To preserve the original files and place copies in the destination, use:
 py media_organizer.py --copy
 ```
 
+### Already ran the program without any flags?
+
+If you already organized a folder using a plain run (no flags), you don't need to start over. Rerun the tool with `--in-place`, pointing both prompts at that same already organized folder, combined with whichever cleanup flags you need:
+
+```powershell
+py media_organizer.py --in-place --dry-run --dedupe-by sha256,stem,visual --trash-duplicates --separate-audio --strip-repaired-suffix --exclude-thumbnails
+```
+
+Review the dry-run output, then drop `--dry-run` to apply it. Files already in the correct place are skipped automatically; only new corruption, duplicates, thumbnails, and audio files are moved.
+
 ### Duplicate detection
 
 Duplicate detection is opt-in. Choose one or more comma-separated keys with `--dedupe-by`:
@@ -122,12 +133,22 @@ Supported keys:
 - `name`: filename, compared without case differences.
 - `size`: file size in bytes.
 - `date`: capture date when available, otherwise the file modification timestamp.
-- `sha256`: exact file-content hash, calculated in streaming chunks.
+- `sha256`: exact file-content hash, calculated in streaming chunks. Only matches byte-identical files.
 - `stem`: filename with recovery-tool noise removed, such as `(deleted <hash>)` segments, backtick-wrapped hash/timestamp tokens, and `_repaired` suffixes. This matches patterns like `DSC00363_2_repaired.jpg` and `DSC00363_30_repaired.jpg` to the same base name `DSC00363`.
+- `visual`: a perceptual hash (dHash) of the photo's content. Unlike `sha256`, this matches the same photo even if it was resized or re-saved at a different quality, since it compares what the image looks like rather than its exact bytes. Applies to photos only; videos and audio are not compared. Near-duplicates are found using bit-difference clustering, controlled by `--visual-threshold` (default `6` out of 64 bits; lower is stricter).
 
-`stem` cannot match files that use entirely different naming schemes for the same photo (for example, a camera-generated name versus a metadata-based name assembled by a recovery tool). For those cases, use `sha256` to compare actual file content instead.
+`stem` cannot match files that use entirely different naming schemes for the same photo (for example, a camera-generated name versus a metadata-based name assembled by a recovery tool). `visual` is the reliable option for that case, since it compares the actual image content instead of the filename.
 
 When multiple keys are selected, all of them must match. The first file found is kept in its normal camera folder; later matching files are placed in `Duplicates` (or `Trash Bin` with `--trash-duplicates`). Use `--dry-run` to review the planned result before moving or copying anything.
+
+To catch the same photo across different resolutions or recompression, and require it to also carry the same camera:
+
+```powershell
+py media_organizer.py --dry-run --dedupe-by visual
+
+# Stricter: only match near-identical visuals AND the same file size
+py media_organizer.py --dry-run --dedupe-by visual,size --visual-threshold 4
+```
 
 To move duplicates to a separate `Trash Bin` folder instead of `Duplicates`, for manual review and removal:
 
@@ -167,6 +188,19 @@ py media_organizer.py --separate-audio
 
 All audio files are then placed directly in an `Audio` folder, regardless of embedded metadata.
 
+### Excluding thumbnail-sized photos
+
+Recovered folders sometimes contain small thumbnail copies (for example `160x120` or `256x171`) alongside the full-size photo. To move these out of the way:
+
+```powershell
+py media_organizer.py --exclude-thumbnails
+
+# Adjust the size threshold (default: 320 pixels on the longer side)
+py media_organizer.py --exclude-thumbnails --thumbnail-max-size 400
+```
+
+A photo is treated as a thumbnail when both its width and height are below the threshold. Matching photos are moved to `Trash Bin` for manual review, never deleted automatically.
+
 You can also double-click `run_media_organizer.bat` from Windows Explorer. Add `--dry-run` or `--copy` after the batch file name when launching it from a terminal.
 
 ## Processing steps
@@ -194,8 +228,10 @@ The script recognizes common formats including:
 - The source and destination must not be the same folder, and the destination must not be inside the source scan path.
 - The script does not overwrite existing files. It creates names such as `photo (1).jpg` when necessary.
 - Duplicate detection is not enabled unless `--dedupe-by` is provided.
-- `name`, `date`, or `stem` alone can produce broad matches. For safer results, prefer `sha256` or combine it with other keys.
+- `name`, `date`, or `stem` alone can produce broad matches. For safer results, prefer `sha256`/`visual` or combine them with other keys.
+- `visual` compares image content, not filenames. It cannot detect cropped, rotated, or heavily edited copies, only the same photo at a different resolution or compression quality.
 - `--trash-duplicates` moves files to a `Trash Bin` folder; it does not delete anything automatically.
+- `--exclude-thumbnails` also moves matching photos to `Trash Bin`; it does not delete anything automatically.
 - `--in-place` is the only way to scan and organize the same folder. Without it, the source and destination must not overlap.
 - Image validation can detect unreadable files, pure black or white images, and large uniform blocks from truncated decodes, but no automated check can identify every visually damaged image.
 - Video and audio validation requires `ffprobe`. Without it, those files remain `unchecked` and are preserved with the other media.

@@ -45,9 +45,10 @@ class MediaFile:
     captured_at: datetime | None = None
     is_duplicate: bool = False
     duplicate_of: Path | None = None
+    is_thumbnail: bool = False
 
 
-DEDUPE_KEYS = {"name", "size", "date", "sha256", "stem"}
+DEDUPE_KEYS = {"name", "size", "date", "sha256", "stem", "visual"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,7 +60,14 @@ def parse_args() -> argparse.Namespace:
         type=parse_dedupe_keys,
         default=(),
         metavar="KEYS",
-        help="Mark duplicates when all selected keys match: name,size,date,sha256,stem (comma-separated).",
+        help="Mark duplicates when all selected keys match: name,size,date,sha256,stem,visual (comma-separated).",
+    )
+    parser.add_argument(
+        "--visual-threshold",
+        type=int,
+        default=6,
+        metavar="N",
+        help="Max perceptual hash difference (0-64 bits) for the 'visual' dedupe key to treat photos as the same photo, even resized or recompressed (default: 6).",
     )
     parser.add_argument(
         "--trash-duplicates",
@@ -75,6 +83,18 @@ def parse_args() -> argparse.Namespace:
         "--strip-repaired-suffix",
         action="store_true",
         help="Remove the '_repaired' keyword (and its numbered variants) from filenames when organizing.",
+    )
+    parser.add_argument(
+        "--exclude-thumbnails",
+        action="store_true",
+        help="Move small thumbnail-sized photos (see --thumbnail-max-size) to the Trash Bin folder.",
+    )
+    parser.add_argument(
+        "--thumbnail-max-size",
+        type=int,
+        default=320,
+        metavar="PIXELS",
+        help="Photos where both width and height are below this size are treated as thumbnails (default: 320).",
     )
     parser.add_argument(
         "--in-place",
@@ -151,7 +171,7 @@ def scan_files(source: Path, output: Path, exclude_output: bool = True) -> list[
 
 def clean_folder_name(value: str) -> str:
     value = re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", value).strip(" .")
-    return value[:120] or "unknown camera"
+    return value[:120] or "unknown device"
 
 
 def normalize_stem(stem: str) -> str:
@@ -227,7 +247,7 @@ def detect_block_corruption(image: Image.Image) -> str | None:
     return None
 
 
-def validate_photo(media: MediaFile) -> None:
+def validate_photo(media: MediaFile, exclude_thumbnails: bool = False, thumbnail_max_size: int = 320) -> None:
     try:
         with Image.open(media.path) as image:
             image.verify()
@@ -235,6 +255,8 @@ def validate_photo(media: MediaFile) -> None:
             width, height = image.size
             if width < 2 or height < 2:
                 raise ValueError("image has no meaningful dimensions")
+            if exclude_thumbnails and max(width, height) < thumbnail_max_size:
+                media.is_thumbnail = True
             image.load()
             extrema = image.convert("L").getextrema()
             if extrema[0] == extrema[1] and extrema[0] in (0, 255):
@@ -303,9 +325,9 @@ def validate_non_photo(media: MediaFile) -> None:
     media.status = "valid"
 
 
-def validate(media: MediaFile) -> None:
+def validate(media: MediaFile, exclude_thumbnails: bool = False, thumbnail_max_size: int = 320) -> None:
     if media.kind == "photo":
-        validate_photo(media)
+        validate_photo(media, exclude_thumbnails, thumbnail_max_size)
     else:
         validate_non_photo(media)
 
@@ -328,6 +350,61 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def dhash_photo(path: Path, hash_size: int = 8) -> str | None:
+    """Perceptual hash: same result for the same photo resized or recompressed differently."""
+    try:
+        with Image.open(path) as image:
+            grey = image.convert("L").resize((hash_size + 1, hash_size), Image.LANCZOS)
+            pixels = list(grey.getdata())
+    except Exception:
+        return None
+    bits = 0
+    width = hash_size + 1
+    for row in range(hash_size):
+        offset = row * width
+        for col in range(hash_size):
+            bits = (bits << 1) | int(pixels[offset + col] > pixels[offset + col + 1])
+    return format(bits, f"0{hash_size * hash_size // 4}x")
+
+
+def hamming_distance(hash_a: str, hash_b: str) -> int:
+    return bin(int(hash_a, 16) ^ int(hash_b, 16)).count("1")
+
+
+def visual_cluster(items: list[MediaFile], threshold: int) -> dict[Path, MediaFile]:
+    """Group photos whose dHash differs by at most `threshold` bits, using LSH banding to avoid O(n^2)."""
+    band_count = 4
+    digests: dict[Path, str] = {}
+    band_buckets: list[dict[str, list[MediaFile]]] = [dict() for _ in range(band_count)]
+    duplicate_of: dict[Path, MediaFile] = {}
+
+    for item in items:
+        digest = dhash_photo(item.path)
+        if digest is None:
+            continue
+        chars_per_band = len(digest) // band_count
+        candidates: dict[int, MediaFile] = {}
+        for band_index in range(band_count):
+            start = band_index * chars_per_band
+            band_key = digest[start:start + chars_per_band]
+            for candidate in band_buckets[band_index].get(band_key, []):
+                candidates[id(candidate)] = candidate
+        match = next(
+            (candidate for candidate in candidates.values()
+             if hamming_distance(digest, digests[candidate.path]) <= threshold),
+            None,
+        )
+        if match is not None:
+            duplicate_of[item.path] = match
+            continue
+        digests[item.path] = digest
+        for band_index in range(band_count):
+            start = band_index * chars_per_band
+            band_key = digest[start:start + chars_per_band]
+            band_buckets[band_index].setdefault(band_key, []).append(item)
+    return duplicate_of
+
+
 def dedupe_key(media: MediaFile, keys: tuple[str, ...]) -> tuple[object, ...] | None:
     values: list[object] = []
     for key in keys:
@@ -348,13 +425,34 @@ def dedupe_key(media: MediaFile, keys: tuple[str, ...]) -> tuple[object, ...] | 
     return tuple(values)
 
 
-def mark_duplicates(media: list[MediaFile], keys: tuple[str, ...]) -> int:
+def mark_duplicates(media: list[MediaFile], keys: tuple[str, ...], visual_threshold: int = 6) -> int:
     if not keys:
         return 0
     print(f"\nSTEP 3/4 - Checking duplicates by: {', '.join(keys)}")
-    seen: dict[tuple[object, ...], MediaFile] = {}
     duplicates = 0
     candidates = [item for item in media if item.status != "corrupted"]
+
+    if "visual" in keys:
+        remainder = tuple(key for key in keys if key != "visual")
+        photo_candidates = [item for item in candidates if item.kind == "photo"]
+        cluster_map = visual_cluster(photo_candidates, threshold=visual_threshold)
+        for index, item in enumerate(photo_candidates, 1):
+            original = cluster_map.get(item.path)
+            if original is not None:
+                key_item = dedupe_key(item, remainder) if remainder else ()
+                key_original = dedupe_key(original, remainder) if remainder else ()
+                if key_item is not None and key_item == key_original:
+                    item.is_duplicate = True
+                    item.duplicate_of = original.path
+                    duplicates += 1
+            print(
+                f"\rChecked duplicates: {index:,}/{len(photo_candidates):,} | Duplicates: {duplicates:,}",
+                end="", flush=True,
+            )
+        print(f"\nDuplicate check complete: {duplicates:,} duplicate files found.")
+        return duplicates
+
+    seen: dict[tuple[object, ...], MediaFile] = {}
     for index, item in enumerate(candidates, 1):
         key = dedupe_key(item, keys)
         if key is not None:
@@ -373,8 +471,8 @@ def choose_unknown_name(media: Iterable[MediaFile]) -> str:
     print("\nSome valid media files do not contain camera maker/model metadata.")
     for item in samples:
         print(f"  {item.path}")
-    answer = input("Folder name for these files [unknown camera]: ").strip()
-    return clean_folder_name(answer or "unknown camera")
+    answer = input("Folder name for these files [unknown device]: ").strip()
+    return clean_folder_name(answer or "unknown device")
 
 
 def move_media(
@@ -391,12 +489,15 @@ def move_media(
     counts = {"valid": 0, "unchecked": 0, "corrupted": 0}
     skipped_in_place = 0
     duplicate_count = sum(1 for item in media if item.is_duplicate)
+    thumbnail_count = sum(1 for item in media if item.is_thumbnail and not item.is_duplicate)
     for index, item in enumerate(media, 1):
         counts[item.status] += 1
         if item.status == "corrupted":
             destination_folder = output / "Corrupted"
         elif item.is_duplicate:
             destination_folder = output / ("Trash Bin" if trash_duplicates else "Duplicates")
+        elif item.is_thumbnail:
+            destination_folder = output / "Trash Bin"
         elif separate_audio and item.kind == "audio":
             destination_folder = output / "Audio"
         else:
@@ -421,6 +522,8 @@ def move_media(
     if duplicate_count:
         bin_name = "Trash Bin" if trash_duplicates else "Duplicates"
         print(f"{duplicate_count:,} duplicate files were placed in '{bin_name}' for review.")
+    if thumbnail_count:
+        print(f"{thumbnail_count:,} thumbnail-sized photos were placed in 'Trash Bin' for review.")
     if skipped_in_place:
         print(f"Skipped {skipped_in_place:,} files already in their correct location.")
     if counts["unchecked"]:
@@ -446,14 +549,14 @@ def main() -> int:
 
     print("\nSTEP 2/4 - Validating media")
     for index, item in enumerate(media, 1):
-        validate(item)
+        validate(item, args.exclude_thumbnails, args.thumbnail_max_size)
         print(f"\rChecked: {index:,}/{len(media):,} | {item.status.upper():10} | {item.path.name}", end="", flush=True)
     print()
     corrupted = [item for item in media if item.status == "corrupted"]
-    mark_duplicates(media, args.dedupe_by)
+    mark_duplicates(media, args.dedupe_by, visual_threshold=args.visual_threshold)
     unknown = [item for item in media if item.status != "corrupted" and not item.is_duplicate and not item.camera]
     print(f"Validation complete: {len(corrupted):,} corrupted; {len(unknown):,} without camera metadata.")
-    unknown_name = choose_unknown_name(unknown) if unknown else "unknown camera"
+    unknown_name = choose_unknown_name(unknown) if unknown else "unknown device"
 
     answer = input("Start organizing files now? [y/N]: ".strip()).strip().lower()
     if answer not in {"y", "yes"}:
