@@ -48,9 +48,13 @@ class MediaFile:
     is_thumbnail: bool = False
     width: int = 0
     height: int = 0
+    audio_title: str = ""
+    audio_artist: str = ""
+    audio_album_artist: str = ""
+    bitrate: int = 0
 
 
-DEDUPE_KEYS = {"name", "size", "date", "sha256", "stem", "visual"}
+DEDUPE_KEYS = {"name", "size", "date", "sha256", "stem", "visual", "audio"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,14 +66,14 @@ def parse_args() -> argparse.Namespace:
         type=parse_dedupe_keys,
         default=(),
         metavar="KEYS",
-        help="Mark duplicates when all selected keys match: name,size,date,sha256,stem,visual (comma-separated).",
+        help="Mark duplicates when all selected keys match: name,size,date,sha256,stem,visual,audio (comma-separated).",
     )
     parser.add_argument(
         "--visual-threshold",
         type=int,
-        default=6,
+        default=24,
         metavar="N",
-        help="Max perceptual hash difference (0-64 bits) for the 'visual' dedupe key to treat photos as the same photo, even resized or recompressed (default: 6).",
+        help="Max perceptual hash difference (0-256 bits) for the 'visual' dedupe key to treat photos as the same photo, even resized or recompressed. Every candidate pair is compared exhaustively using two independent hashes that must both agree, for maximum accuracy (default: 24).",
     )
     parser.add_argument(
         "--trash-duplicates",
@@ -85,6 +89,11 @@ def parse_args() -> argparse.Namespace:
         "--strip-repaired-suffix",
         action="store_true",
         help="Remove the '_repaired' keyword (and its numbered variants) from filenames when organizing.",
+    )
+    parser.add_argument(
+        "--strip-numeric-suffix",
+        action="store_true",
+        help="Remove a trailing random numeric ID, such as '_170385735', appended by sync or recovery tools.",
     )
     parser.add_argument(
         "--exclude-thumbnails",
@@ -213,6 +222,14 @@ def strip_repaired_suffix(filename: str) -> str:
     return f"{stem or path.stem}{path.suffix}"
 
 
+def strip_numeric_suffix(filename: str) -> str:
+    """Remove a trailing random numeric ID such as '_170385735' appended by sync/recovery tools."""
+    path = Path(filename)
+    stem = re.sub(r"[ _-]\d{4,}$", "", path.stem)
+    stem = stem.strip(" _-")
+    return f"{stem or path.stem}{path.suffix}"
+
+
 def exif_text(exif: object, names: tuple[str, ...]) -> str:
     if not exif:
         return ""
@@ -299,7 +316,7 @@ def validate_photo(media: MediaFile, exclude_thumbnails: bool = False, thumbnail
 def ffprobe(path: Path) -> dict | None:
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format_tags:stream_tags", "-of", "json", str(path)],
+            ["ffprobe", "-v", "error", "-show_entries", "format=bit_rate:format_tags:stream_tags", "-of", "json", str(path)],
             capture_output=True, timeout=90, check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -337,6 +354,18 @@ def validate_non_photo(media: MediaFile) -> None:
     make = tags.get("make", tags.get("manufacturer", ""))
     model = tags.get("model", tags.get("device_model", ""))
     media.camera = clean_folder_name(" ".join(part for part in (str(make).strip(), str(model).strip()) if part))
+    media.audio_title = str(tags.get("title", "")).strip()
+    subtitle = str(tags.get("subtitle", "")).strip()
+    if subtitle:
+        media.audio_title = f"{media.audio_title} {subtitle}".strip()
+    artist = tags.get("artist") or tags.get("contributing_artist") or tags.get("performer") or ""
+    media.audio_artist = str(artist).strip()
+    album_artist = tags.get("album_artist") or tags.get("albumartist") or ""
+    media.audio_album_artist = str(album_artist).strip()
+    try:
+        media.bitrate = int(float(probe.get("format", {}).get("bit_rate", 0)))
+    except (TypeError, ValueError):
+        media.bitrate = 0
     media.captured_at = (
         parse_datetime(str(tags.get("creation_time", "")))
         or parse_datetime(str(tags.get("date", "")))
@@ -370,7 +399,7 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def dhash_photo(path: Path, hash_size: int = 8) -> str | None:
+def dhash_photo(path: Path, hash_size: int = 16) -> str | None:
     """Perceptual hash: same result for the same photo resized or recompressed differently."""
     try:
         with Image.open(path) as image:
@@ -387,47 +416,71 @@ def dhash_photo(path: Path, hash_size: int = 8) -> str | None:
     return format(bits, f"0{hash_size * hash_size // 4}x")
 
 
+def ahash_photo(path: Path, hash_size: int = 16) -> str | None:
+    """Average hash: a second, independent perceptual signal to confirm a dHash match."""
+    try:
+        with Image.open(path) as image:
+            grey = image.convert("L").resize((hash_size, hash_size), Image.LANCZOS)
+            pixels = list(grey.getdata())
+    except Exception:
+        return None
+    average = sum(pixels) / len(pixels)
+    bits = 0
+    for value in pixels:
+        bits = (bits << 1) | int(value > average)
+    return format(bits, f"0{hash_size * hash_size // 4}x")
+
+
 def hamming_distance(hash_a: str, hash_b: str) -> int:
     return bin(int(hash_a, 16) ^ int(hash_b, 16)).count("1")
 
 
 def visual_cluster(items: list[MediaFile], threshold: int) -> list[list[MediaFile]]:
-    """Group photos whose dHash differs by at most `threshold` bits, using LSH banding to avoid O(n^2)."""
-    band_count = 4
-    digests: dict[Path, str] = {}
-    band_buckets: list[dict[str, list[MediaFile]]] = [dict() for _ in range(band_count)]
-    cluster_of: dict[Path, int] = {}
-    clusters: list[list[MediaFile]] = []
+    """Exhaustively compare every candidate pair; a match requires BOTH dHash and aHash to agree."""
+    n = len(items)
+    if n < 2:
+        return []
+    dhashes: list[str | None] = [None] * n
+    ahashes: list[str | None] = [None] * n
+    buckets: dict[float, list[int]] = {}
+    for index, item in enumerate(items):
+        dhashes[index] = dhash_photo(item.path)
+        ahashes[index] = ahash_photo(item.path)
+        if dhashes[index] is None or ahashes[index] is None:
+            continue
+        aspect = round(item.width / item.height, 2) if item.height else 0.0
+        buckets.setdefault(aspect, []).append(index)
+        print(f"\rHashed {index + 1:,}/{n:,} photos for visual comparison", end="", flush=True)
+    print()
 
-    for item in items:
-        digest = dhash_photo(item.path)
-        if digest is None:
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parent[root_a] = root_b
+
+    for indices in buckets.values():
+        for position, i in enumerate(indices):
+            for j in indices[position + 1:]:
+                if (
+                    hamming_distance(dhashes[i], dhashes[j]) <= threshold
+                    and hamming_distance(ahashes[i], ahashes[j]) <= threshold
+                ):
+                    union(i, j)
+
+    groups: dict[int, list[MediaFile]] = {}
+    for index, item in enumerate(items):
+        if dhashes[index] is None:
             continue
-        chars_per_band = len(digest) // band_count
-        candidates: dict[int, MediaFile] = {}
-        for band_index in range(band_count):
-            start = band_index * chars_per_band
-            band_key = digest[start:start + chars_per_band]
-            for candidate in band_buckets[band_index].get(band_key, []):
-                candidates[id(candidate)] = candidate
-        match = next(
-            (candidate for candidate in candidates.values()
-             if hamming_distance(digest, digests[candidate.path]) <= threshold),
-            None,
-        )
-        if match is not None:
-            cluster_index = cluster_of[match.path]
-            clusters[cluster_index].append(item)
-            cluster_of[item.path] = cluster_index
-            continue
-        digests[item.path] = digest
-        cluster_of[item.path] = len(clusters)
-        clusters.append([item])
-        for band_index in range(band_count):
-            start = band_index * chars_per_band
-            band_key = digest[start:start + chars_per_band]
-            band_buckets[band_index].setdefault(band_key, []).append(item)
-    return [cluster for cluster in clusters if len(cluster) > 1]
+        groups.setdefault(find(index), []).append(item)
+    return [group for group in groups.values() if len(group) > 1]
 
 
 def dedupe_key(media: MediaFile, keys: tuple[str, ...]) -> tuple[object, ...] | None:
@@ -445,16 +498,25 @@ def dedupe_key(media: MediaFile, keys: tuple[str, ...]) -> tuple[object, ...] | 
                 values.append(sha256_file(media.path))
             elif key == "stem":
                 values.append(normalize_stem(media.path.stem))
+            elif key == "audio":
+                if media.kind != "audio" or not media.audio_title.strip():
+                    return None
+                values.append(media.audio_title.strip().casefold())
+                values.append(media.audio_artist.strip().casefold())
+                values.append(media.audio_album_artist.strip().casefold())
         except OSError:
             return None
     return tuple(values)
 
 
 def pick_representative(group: list[MediaFile]) -> MediaFile:
-    """Prefer the highest-resolution photo in a duplicate group; otherwise keep the first found."""
+    """Prefer the highest-resolution photo, or highest-bitrate song, in a duplicate group."""
     photos = [item for item in group if item.kind == "photo" and item.width and item.height]
     if photos:
         return max(photos, key=lambda item: item.width * item.height)
+    audio_items = [item for item in group if item.kind == "audio" and item.bitrate]
+    if audio_items:
+        return max(audio_items, key=lambda item: item.bitrate)
     return group[0]
 
 
@@ -468,7 +530,16 @@ def mark_duplicates(media: list[MediaFile], keys: tuple[str, ...], visual_thresh
     if "visual" in keys:
         remainder = tuple(key for key in keys if key != "visual")
         photo_candidates = [item for item in candidates if item.kind == "photo"]
-        clusters = visual_cluster(photo_candidates, threshold=visual_threshold)
+        folder_groups: dict[object, list[MediaFile]] = {}
+        for item in photo_candidates:
+            # Group by detected camera when known, so scattered same-device photos are still
+            # compared together; fall back to the current folder for unknown-device photos.
+            group_key = item.camera if item.camera else item.path.parent
+            folder_groups.setdefault(group_key, []).append(item)
+        clusters: list[list[MediaFile]] = []
+        for group_index, group_items in enumerate(folder_groups.values(), 1):
+            print(f"\nGroup {group_index:,}/{len(folder_groups):,}: {len(group_items):,} photos")
+            clusters.extend(visual_cluster(group_items, threshold=visual_threshold))
         for cluster in clusters:
             if remainder:
                 groups: dict[tuple[object, ...], list[MediaFile]] = {}
@@ -530,6 +601,7 @@ def move_media(
     separate_audio: bool = False,
     trash_duplicates: bool = False,
     strip_repaired: bool = False,
+    strip_numeric: bool = False,
 ) -> None:
     print("\nSTEP 4/4 - Organizing files")
     counts = {"valid": 0, "unchecked": 0, "corrupted": 0}
@@ -550,6 +622,7 @@ def move_media(
             camera = item.camera or unknown_name
             destination_folder = output / camera
         target_name = strip_repaired_suffix(item.path.name) if strip_repaired else item.path.name
+        target_name = strip_numeric_suffix(target_name) if strip_numeric else target_name
         prospective_destination = destination_folder / target_name
         if prospective_destination.resolve() == item.path.resolve():
             skipped_in_place += 1
@@ -632,6 +705,7 @@ def main() -> int:
         media, output, unknown_name, args.dry_run, args.copy,
         separate_audio=args.separate_audio, trash_duplicates=args.trash_duplicates,
         strip_repaired=args.strip_repaired_suffix,
+        strip_numeric=args.strip_numeric_suffix,
     )
     return 0
 
