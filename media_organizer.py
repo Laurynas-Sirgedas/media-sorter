@@ -46,6 +46,8 @@ class MediaFile:
     is_duplicate: bool = False
     duplicate_of: Path | None = None
     is_thumbnail: bool = False
+    width: int = 0
+    height: int = 0
 
 
 DEDUPE_KEYS = {"name", "size", "date", "sha256", "stem", "visual"}
@@ -100,6 +102,23 @@ def parse_args() -> argparse.Namespace:
         "--in-place",
         action="store_true",
         help="Rescan an already organized folder (source and output may be the same) to fix corrupted or duplicate files.",
+    )
+    parser.add_argument(
+        "--source",
+        type=Path,
+        metavar="PATH",
+        help="Folder or drive to scan. Skips the interactive prompt.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        metavar="PATH",
+        help="Existing output folder or drive. Skips the interactive prompt.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Run unattended: skip the final confirmation and use 'unknown device' automatically without asking.",
     )
     return parser.parse_args()
 
@@ -255,6 +274,7 @@ def validate_photo(media: MediaFile, exclude_thumbnails: bool = False, thumbnail
             width, height = image.size
             if width < 2 or height < 2:
                 raise ValueError("image has no meaningful dimensions")
+            media.width, media.height = width, height
             if exclude_thumbnails and max(width, height) < thumbnail_max_size:
                 media.is_thumbnail = True
             image.load()
@@ -371,12 +391,13 @@ def hamming_distance(hash_a: str, hash_b: str) -> int:
     return bin(int(hash_a, 16) ^ int(hash_b, 16)).count("1")
 
 
-def visual_cluster(items: list[MediaFile], threshold: int) -> dict[Path, MediaFile]:
+def visual_cluster(items: list[MediaFile], threshold: int) -> list[list[MediaFile]]:
     """Group photos whose dHash differs by at most `threshold` bits, using LSH banding to avoid O(n^2)."""
     band_count = 4
     digests: dict[Path, str] = {}
     band_buckets: list[dict[str, list[MediaFile]]] = [dict() for _ in range(band_count)]
-    duplicate_of: dict[Path, MediaFile] = {}
+    cluster_of: dict[Path, int] = {}
+    clusters: list[list[MediaFile]] = []
 
     for item in items:
         digest = dhash_photo(item.path)
@@ -395,14 +416,18 @@ def visual_cluster(items: list[MediaFile], threshold: int) -> dict[Path, MediaFi
             None,
         )
         if match is not None:
-            duplicate_of[item.path] = match
+            cluster_index = cluster_of[match.path]
+            clusters[cluster_index].append(item)
+            cluster_of[item.path] = cluster_index
             continue
         digests[item.path] = digest
+        cluster_of[item.path] = len(clusters)
+        clusters.append([item])
         for band_index in range(band_count):
             start = band_index * chars_per_band
             band_key = digest[start:start + chars_per_band]
             band_buckets[band_index].setdefault(band_key, []).append(item)
-    return duplicate_of
+    return [cluster for cluster in clusters if len(cluster) > 1]
 
 
 def dedupe_key(media: MediaFile, keys: tuple[str, ...]) -> tuple[object, ...] | None:
@@ -425,6 +450,14 @@ def dedupe_key(media: MediaFile, keys: tuple[str, ...]) -> tuple[object, ...] | 
     return tuple(values)
 
 
+def pick_representative(group: list[MediaFile]) -> MediaFile:
+    """Prefer the highest-resolution photo in a duplicate group; otherwise keep the first found."""
+    photos = [item for item in group if item.kind == "photo" and item.width and item.height]
+    if photos:
+        return max(photos, key=lambda item: item.width * item.height)
+    return group[0]
+
+
 def mark_duplicates(media: list[MediaFile], keys: tuple[str, ...], visual_threshold: int = 6) -> int:
     if not keys:
         return 0
@@ -435,34 +468,47 @@ def mark_duplicates(media: list[MediaFile], keys: tuple[str, ...], visual_thresh
     if "visual" in keys:
         remainder = tuple(key for key in keys if key != "visual")
         photo_candidates = [item for item in candidates if item.kind == "photo"]
-        cluster_map = visual_cluster(photo_candidates, threshold=visual_threshold)
-        for index, item in enumerate(photo_candidates, 1):
-            original = cluster_map.get(item.path)
-            if original is not None:
-                key_item = dedupe_key(item, remainder) if remainder else ()
-                key_original = dedupe_key(original, remainder) if remainder else ()
-                if key_item is not None and key_item == key_original:
-                    item.is_duplicate = True
-                    item.duplicate_of = original.path
-                    duplicates += 1
-            print(
-                f"\rChecked duplicates: {index:,}/{len(photo_candidates):,} | Duplicates: {duplicates:,}",
-                end="", flush=True,
-            )
-        print(f"\nDuplicate check complete: {duplicates:,} duplicate files found.")
+        clusters = visual_cluster(photo_candidates, threshold=visual_threshold)
+        for cluster in clusters:
+            if remainder:
+                groups: dict[tuple[object, ...], list[MediaFile]] = {}
+                for item in cluster:
+                    subkey = dedupe_key(item, remainder)
+                    if subkey is not None:
+                        groups.setdefault(subkey, []).append(item)
+                subclusters = list(groups.values())
+            else:
+                subclusters = [cluster]
+            for group in subclusters:
+                if len(group) < 2:
+                    continue
+                representative = pick_representative(group)
+                for item in group:
+                    if item is not representative:
+                        item.is_duplicate = True
+                        item.duplicate_of = representative.path
+                        duplicates += 1
+        print(f"Checked {len(photo_candidates):,} photos for visual duplicates.")
+        print(f"Duplicate check complete: {duplicates:,} duplicate files found.")
         return duplicates
 
-    seen: dict[tuple[object, ...], MediaFile] = {}
+    groups: dict[tuple[object, ...], list[MediaFile]] = {}
     for index, item in enumerate(candidates, 1):
         key = dedupe_key(item, keys)
         if key is not None:
-            original = seen.setdefault(key, item)
-            if original is not item:
+            groups.setdefault(key, []).append(item)
+        print(f"\rChecked: {index:,}/{len(candidates):,}", end="", flush=True)
+    print()
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        representative = pick_representative(group)
+        for item in group:
+            if item is not representative:
                 item.is_duplicate = True
-                item.duplicate_of = original.path
+                item.duplicate_of = representative.path
                 duplicates += 1
-        print(f"\rChecked duplicates: {index:,}/{len(candidates):,} | Duplicates: {duplicates:,}", end="", flush=True)
-    print(f"\nDuplicate check complete: {duplicates:,} duplicate files found.")
+    print(f"Duplicate check complete: {duplicates:,} duplicate files found.")
     return duplicates
 
 
@@ -530,11 +576,23 @@ def move_media(
         print("Note: unchecked video/audio files were placed with valid media because ffprobe was unavailable.")
 
 
+def resolve_folder_arg(path: Path | None, prompt: str) -> Path | None:
+    if path is None:
+        return prompt_folder(prompt)
+    resolved = path.expanduser()
+    if not (resolved.exists() and resolved.is_dir()):
+        print(f"Folder does not exist or is not a folder: {resolved}")
+        return None
+    return resolved.resolve()
+
+
 def main() -> int:
     args = parse_args()
     print("Media Organizer")
-    source = prompt_folder("1) Folder or drive to scan (example C:\\): ")
-    output = prompt_folder("2) Existing output folder or drive (example F:\\): ")
+    source = resolve_folder_arg(args.source, "1) Folder or drive to scan (example C:\\): ")
+    output = resolve_folder_arg(args.output, "2) Existing output folder or drive (example F:\\): ")
+    if source is None or output is None:
+        return 2
     if args.in_place:
         print("IN-PLACE MODE: rescanning the destination itself to fix corrupted or duplicate files.")
     elif source == output or is_inside(output, source):
@@ -542,6 +600,8 @@ def main() -> int:
         return 2
     if args.dry_run:
         print("DRY RUN: no files will be changed.")
+    if args.yes:
+        print("UNATTENDED MODE: no further confirmation will be requested.")
 
     media = scan_files(source, output, exclude_output=not args.in_place)
     if not media:
@@ -556,12 +616,18 @@ def main() -> int:
     mark_duplicates(media, args.dedupe_by, visual_threshold=args.visual_threshold)
     unknown = [item for item in media if item.status != "corrupted" and not item.is_duplicate and not item.camera]
     print(f"Validation complete: {len(corrupted):,} corrupted; {len(unknown):,} without camera metadata.")
-    unknown_name = choose_unknown_name(unknown) if unknown else "unknown device"
+    if unknown and not args.yes:
+        unknown_name = choose_unknown_name(unknown)
+    else:
+        unknown_name = "unknown device"
+        if unknown:
+            print(f"{len(unknown):,} files without camera metadata will use 'unknown device' (unattended mode).")
 
-    answer = input("Start organizing files now? [y/N]: ".strip()).strip().lower()
-    if answer not in {"y", "yes"}:
-        print("No files were changed.")
-        return 0
+    if not args.yes:
+        answer = input("Start organizing files now? [y/N]: ".strip()).strip().lower()
+        if answer not in {"y", "yes"}:
+            print("No files were changed.")
+            return 0
     move_media(
         media, output, unknown_name, args.dry_run, args.copy,
         separate_audio=args.separate_audio, trash_duplicates=args.trash_duplicates,

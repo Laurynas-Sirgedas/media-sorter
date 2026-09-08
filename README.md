@@ -89,6 +89,19 @@ The program asks for:
 
 It then scans, validates, asks how to name files without camera metadata, and requests final confirmation before changing anything.
 
+### Run and forget (fully unattended)
+
+To run the tool without answering any prompts, provide the folders on the command line and add `--yes`:
+
+```powershell
+py media_organizer.py --source F:\ --output F:\Media Organized --yes --dedupe-by sha256,stem,visual --trash-duplicates
+```
+
+- `--source` and `--output` skip the two folder prompts.
+- `--yes` skips the unknown-device naming prompt (uses `unknown device` automatically) and the final confirmation.
+
+Always test the same command with `--dry-run` first, since an unattended run applies changes immediately with no chance to review.
+
 ### Recommended first run
 
 Use a dry run with a small test folder before processing an entire drive:
@@ -139,7 +152,7 @@ Supported keys:
 
 `stem` cannot match files that use entirely different naming schemes for the same photo (for example, a camera-generated name versus a metadata-based name assembled by a recovery tool). `visual` is the reliable option for that case, since it compares the actual image content instead of the filename.
 
-When multiple keys are selected, all of them must match. The first file found is kept in its normal camera folder; later matching files are placed in `Duplicates` (or `Trash Bin` with `--trash-duplicates`). Use `--dry-run` to review the planned result before moving or copying anything.
+When multiple keys are selected, all of them must match. Among files in the same duplicate group, the photo with the highest resolution is kept in its normal camera folder; the rest are placed in `Duplicates` (or `Trash Bin` with `--trash-duplicates`). For non-photo duplicates (or when resolution can't be compared), the first file found is kept. Use `--dry-run` to review the planned result before moving or copying anything.
 
 To catch the same photo across different resolutions or recompression, and require it to also carry the same camera:
 
